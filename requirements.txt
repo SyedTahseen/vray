@@ -1,6 +1,5 @@
-aiogram==3.13.1
-aiohttp==3.10.10
-aiosqlite==0.20.0
-python-dotenv==1.0.1
-aiohttp_socks==0.9.1
-
+aiogram>=3.31,<4
+aiohttp>=3.13.4,<4
+aiosqlite>=0.20,<1
+python-dotenv>=1.0,<2
+aiohttp_socks>=0.9.1,<1
