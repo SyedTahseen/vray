@@ -47,4 +47,14 @@ assert calls[-1][0] == "https://b/dl"
 assert calls[-1][1] == settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS  # big download gets the long timeout
 assert settings.FUNCTIONAL_TEST_DOWNLOAD_MIN_BYTES == 10_000_000 and "bytes=10000000" in settings.FUNCTIONAL_TEST_DOWNLOAD_URL
 
+ft._stats.clear(); ft._download_mbps.clear()
+asyncio.run(probe([None, None]))
+asyncio.run(probe([1500, 2000]))
+asyncio.run(probe([100, 100, 1, None, None], True, CHECKS))
+asyncio.run(probe([100, 100, None, None], False, CHECKS))
+assert dict(ft._stats) == {"fail_main_test": 1, "fail_latency": 1, "fail_download": 1, "fail_second-target": 1}, dict(ft._stats)
+ft._download_mbps.clear()
+asyncio.run(probe([100, 100, 1, 2000], True, CHECKS))
+assert len(ft._download_mbps) == 1 and abs(ft._download_mbps[0] - 40.0) < 0.01, ft._download_mbps  # 10 MB in 2 s = 40 Mbps
+ft._log_stats("t", 5, {1: (100, None), 2: (None, None)}, ["download"])
 print("functional logic tests: ALL PASSED")

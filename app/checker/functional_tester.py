@@ -3,8 +3,10 @@ import json
 import logging
 import os
 import socket
+import statistics
 import tempfile
 import time
+from collections import Counter
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -21,6 +23,11 @@ Entry = tuple[int, str, dict, int]
 ProbeResult = tuple[int | None, dict | None]
 
 _xray_lock = asyncio.Lock()
+
+# Per-run statistics, reset at the start of every _test_all() (which runs under _xray_lock).
+_stats: Counter = Counter()
+_download_mbps: list[float] = []
+_pass_latencies: list[int] = []
 
 
 def _free_ports(n: int) -> list[int]:
@@ -157,8 +164,10 @@ async def _passes_check(port: int, check: Check) -> bool:
         # don't starve each other of bandwidth and make healthy proxies look dead.
         async with _get_download_sem():
             for _ in range(2):
-                if await _request_once(port, url, expected, min_bytes,
-                                       settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS) is not None:
+                ms = await _request_once(port, url, expected, min_bytes,
+                                         settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS)
+                if ms is not None:
+                    _download_mbps.append(min_bytes * 8 / 1_000_000 / max(ms, 1) * 1000)
                     return True
         return False
     for _ in range(2):
@@ -182,16 +191,21 @@ async def _probe_one(sem: asyncio.Semaphore, key: int, port: int, want_geo: bool
             if len(latencies) + (attempts - i - 1) < need:
                 break
         if len(latencies) < need:
+            _stats["fail_main_test"] += 1
             return key, (None, None)
 
         best = min(latencies)
         ceiling = settings.FUNCTIONAL_TEST_MAX_LATENCY_MS
         if ceiling and best > ceiling:
+            _stats["fail_latency"] += 1
             return key, (None, None)
 
         for check in checks:
             if not await _passes_check(port, check):
+                _stats[f"fail_{check[0]}"] += 1
                 return key, (None, None)
+
+        _pass_latencies.append(best)
 
         geo = await _exit_geo(port) if want_geo and settings.EXIT_GEO_ENABLED else None
         return key, (best, geo)
@@ -280,6 +294,7 @@ async def _run_batch(items: list[Item], want_geo: bool, checks: tuple | list = (
                     "Config %d failed to start standalone in xray - marking as failed. output: %s",
                     items[0][0], output,
                 )
+                _stats["fail_xray_start"] += 1
                 return {items[0][0]: (None, None)}
 
             log.warning(
@@ -308,7 +323,7 @@ async def _run_batch(items: list[Item], want_geo: bool, checks: tuple | list = (
                 pass
 
 
-async def _test_all(items: list[Item], want_geo: bool = False) -> dict[int, ProbeResult]:
+async def _test_all(items: list[Item], want_geo: bool = False, label: str = "Real test") -> dict[int, ProbeResult]:
     chunk_size = settings.FUNCTIONAL_TEST_CHUNK_SIZE
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     log.info(
@@ -320,13 +335,38 @@ async def _test_all(items: list[Item], want_geo: bool = False) -> dict[int, Prob
 
     results: dict[int, ProbeResult] = {}
     async with _xray_lock:
+        _stats.clear()
+        _download_mbps.clear()
+        _pass_latencies.clear()
         checks = await _usable_checks()
+        skipped = [c[0] for c in _configured_checks() if c not in checks]
         for chunk in chunks:
             try:
                 results.update(await _run_batch(chunk, want_geo, checks))
             except Exception:
+                _stats["crashed_untested"] += len(chunk)
                 log.exception("Functional test batch crashed; %d config(s) left untested", len(chunk))
+        _log_stats(label, len(items), results, skipped)
     return results
+
+
+def _log_stats(label: str, tested: int, results: dict, skipped_checks: list[str]) -> None:
+    passed = sum(1 for latency, _geo in results.values() if latency is not None)
+    reasons = ", ".join(f"{k[5:] if k.startswith('fail_') else k}={v}"
+                        for k, v in sorted(_stats.items(), key=lambda kv: -kv[1])) or "none"
+    log.info("%s stats: %d tested -> %d passed, %d failed | failed at: %s",
+             label, tested, passed, tested - passed, reasons)
+    if skipped_checks:
+        log.warning("%s: check(s) skipped this run because they fail without a proxy too: %s",
+                    label, ", ".join(skipped_checks))
+    if _pass_latencies:
+        lat = sorted(_pass_latencies)
+        log.info("%s latency of passing proxies (ms): best=%d median=%d worst=%d",
+                 label, lat[0], int(statistics.median(lat)), lat[-1])
+    if _download_mbps:
+        mb = sorted(_download_mbps)
+        log.info("%s download speed of passing proxies (Mbps, %d samples): slowest=%.1f median=%.1f fastest=%.1f",
+                 label, len(mb), mb[0], statistics.median(mb), mb[-1])
 
 
 def _xray_ready() -> bool:
@@ -366,7 +406,7 @@ async def test_new_candidates(candidates: list[dict]) -> list[dict]:
         else:
             items.append((index, outbound))
 
-    results = await _test_all(items, want_geo=True) if items else {}
+    results = await _test_all(items, want_geo=True, label="New candidates") if items else {}
     verified = []
     for index, (latency, geo) in results.items():
         if latency is None:
@@ -393,7 +433,7 @@ async def _recheck(targets: list, label: str) -> int:
         else:
             items.append((config_id, outbound))
 
-    results = await _test_all(items)
+    results = await _test_all(items, label=label)
     passed = {key: latency for key, (latency, _geo) in results.items() if latency is not None}
     failed = [key for key, (latency, _geo) in results.items() if latency is None]
 

@@ -71,6 +71,15 @@ async def main() -> None:
         raise SystemExit("Invalid configuration:\n  - " + "\n  - ".join(problems))
 
     await db.init_db()
+    log.info(
+        "Test settings: probes need %d/%d passes, max latency %d ms, extra checks=%s, "
+        "download >=%d bytes within %gs (max %d at once), reverify every %gh, fetch every %d min",
+        settings.FUNCTIONAL_TEST_MIN_PASSES, settings.FUNCTIONAL_TEST_ATTEMPTS,
+        settings.FUNCTIONAL_TEST_MAX_LATENCY_MS, settings.FUNCTIONAL_TEST_EXTRA_CHECKS,
+        settings.FUNCTIONAL_TEST_DOWNLOAD_MIN_BYTES, settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS,
+        settings.FUNCTIONAL_TEST_DOWNLOAD_CONCURRENCY, settings.REVERIFY_INTERVAL_HOURS,
+        settings.FETCH_INTERVAL_MINUTES,
+    )
     if "example/example-repo" in settings.GITHUB_RAW_URL:
         log.error(
             "GITHUB_RAW_URL is still the placeholder from the defaults - no proxies can be fetched. "
