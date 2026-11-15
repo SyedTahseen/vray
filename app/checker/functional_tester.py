@@ -81,6 +81,8 @@ async def _wait_for_ports(proc: asyncio.subprocess.Process, ports: list[int], ti
 
 Check = tuple[str, str, int, int]
 
+LARGE_DOWNLOAD_BYTES = 1_000_000
+
 
 def _proxy_session(port: int) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
@@ -89,13 +91,13 @@ def _proxy_session(port: int) -> aiohttp.ClientSession:
 
 
 async def _request_once(port: int, url: str | None = None, expected: int | None = None,
-                        min_bytes: int = 0) -> int | None:
+                        min_bytes: int = 0, timeout: float | None = None) -> int | None:
     start = time.monotonic()
     try:
         async with _proxy_session(port) as session:
             async with session.get(
                 url or settings.FUNCTIONAL_TEST_URL,
-                timeout=aiohttp.ClientTimeout(total=settings.FUNCTIONAL_TEST_TIMEOUT_SECONDS),
+                timeout=aiohttp.ClientTimeout(total=timeout or settings.FUNCTIONAL_TEST_TIMEOUT_SECONDS),
                 allow_redirects=True,
             ) as resp:
                 body = await resp.read()
@@ -138,8 +140,27 @@ async def _exit_geo(port: int) -> dict | None:
         return None
 
 
+_download_sem: asyncio.Semaphore | None = None
+
+
+def _get_download_sem() -> asyncio.Semaphore:
+    global _download_sem
+    if _download_sem is None:
+        _download_sem = asyncio.Semaphore(settings.FUNCTIONAL_TEST_DOWNLOAD_CONCURRENCY)
+    return _download_sem
+
+
 async def _passes_check(port: int, check: Check) -> bool:
     _name, url, expected, min_bytes = check
+    if min_bytes >= LARGE_DOWNLOAD_BYTES:
+        # Big downloads need a longer timeout, and only a few may run at once so they
+        # don't starve each other of bandwidth and make healthy proxies look dead.
+        async with _get_download_sem():
+            for _ in range(2):
+                if await _request_once(port, url, expected, min_bytes,
+                                       settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS) is not None:
+                    return True
+        return False
     for _ in range(2):
         if await _request_once(port, url, expected, min_bytes) is not None:
             return True
@@ -188,17 +209,18 @@ def _configured_checks() -> list[Check]:
     return checks
 
 
-async def _direct_get(url: str) -> tuple[int, int]:
+async def _direct_get(url: str, timeout: float | None = None) -> tuple[int, int]:
     async with aiohttp.ClientSession() as session:
         async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=settings.FUNCTIONAL_TEST_TIMEOUT_SECONDS)
+            url, timeout=aiohttp.ClientTimeout(total=timeout or settings.FUNCTIONAL_TEST_TIMEOUT_SECONDS)
         ) as resp:
             return resp.status, len(await resp.read())
 
 
 async def _direct_ok(url: str, expected: int, min_bytes: int) -> bool:
+    timeout = settings.FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS if min_bytes >= LARGE_DOWNLOAD_BYTES else None
     try:
-        status, size = await _direct_get(url)
+        status, size = await _direct_get(url, timeout)
     except Exception:
         return False
     return status == expected and size >= min_bytes
@@ -332,15 +354,9 @@ async def internet_ok() -> bool:
 OUTAGE_MIN_SAMPLE = 20
 
 
-async def should_cache_rejections(total: int, passed: int) -> bool:
-    if total < OUTAGE_MIN_SAMPLE or passed > 0:
-        return True
-    return await internet_ok()
-
-
-async def test_new_candidates(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
+async def test_new_candidates(candidates: list[dict]) -> list[dict]:
     if not candidates or not _xray_ready():
-        return [], []
+        return []
 
     items, unbuildable = [], []
     for index, candidate in enumerate(candidates):
@@ -357,18 +373,17 @@ async def test_new_candidates(candidates: list[dict]) -> tuple[list[dict], list[
             continue
         verified.append({**candidates[index], **{k: v for k, v in (geo or {}).items() if v},
                          "latency_ms": latency})
-    failed = unbuildable + [candidates[index] for index, (latency, _geo) in results.items() if latency is None]
     log.info(
         "Functional testing complete: %d/%d candidate(s) verified (%d unsupported by the "
         "outbound builder)", len(verified), len(candidates), len(unbuildable),
     )
-    return verified, failed
+    return verified
 
 
 _sweep_lock = asyncio.Lock()
 
 
-async def _recheck(targets: list, label: str, guard_all_failed: bool) -> int:
+async def _recheck(targets: list, label: str) -> int:
     items, unusable = [], []
     for config_id, raw_link in targets:
         parsed = parser.parse_line(raw_link)
@@ -382,7 +397,10 @@ async def _recheck(targets: list, label: str, guard_all_failed: bool) -> int:
     passed = {key: latency for key, (latency, _geo) in results.items() if latency is not None}
     failed = [key for key, (latency, _geo) in results.items() if latency is None]
 
-    if guard_all_failed and len(results) >= OUTAGE_MIN_SAMPLE and not passed:
+    # Safety net: if (nearly) everything failed the problem is almost certainly this
+    # server's connection, not the proxies. Since failures are now deleted for good,
+    # don't wipe the list in that case.
+    if len(results) >= OUTAGE_MIN_SAMPLE and not passed:
         log.error(
             "%s: all %d tested proxies failed - assuming a local problem, "
             "keeping the list unchanged", label, len(results),
@@ -392,20 +410,18 @@ async def _recheck(targets: list, label: str, guard_all_failed: bool) -> int:
     if len(targets) >= OUTAGE_MIN_SAMPLE and len(unusable) > len(targets) // 2:
         log.error(
             "%s: %d of %d configs can no longer be built into an Xray outbound - assuming a "
-            "tooling/version mismatch, not striking them", label, len(unusable), len(targets),
+            "tooling/version mismatch, not removing them", label, len(unusable), len(targets),
         )
         unusable = []
 
     await db.update_reverified(passed)
-    removed = await db.record_failures(failed + unusable, settings.REVERIFY_MAX_FAILS)
-    log.info(
-        "%s: %d passed, %d failed, %d unusable; %d removed (after %d strike(s))",
-        label, len(passed), len(failed), len(unusable), removed, settings.REVERIFY_MAX_FAILS,
-    )
+    removed = await db.delete_configs(failed + unusable)
+    log.info("%s: %d passed, %d failed, %d unusable; %d removed",
+             label, len(passed), len(failed), len(unusable), removed)
     return removed
 
 
-async def _sweep(label: str, get_targets, guard_all_failed: bool) -> int:
+async def _sweep(label: str, get_targets) -> int:
     if not _xray_ready():
         return 0
     async with _sweep_lock:
@@ -416,12 +432,8 @@ async def _sweep(label: str, get_targets, guard_all_failed: bool) -> int:
         if not await internet_ok():
             log.warning("%s skipped: no direct internet access, results would be meaningless", label)
             return 0
-        return await _recheck(targets, label, guard_all_failed)
+        return await _recheck(targets, label)
 
 
 async def reverify_verified_configs() -> int:
-    return await _sweep("Reverify sweep", db.get_all_verified, guard_all_failed=True)
-
-
-async def recheck_failing_configs() -> int:
-    return await _sweep("Failing-proxy recheck", db.get_failing, guard_all_failed=False)
+    return await _sweep("Reverify sweep", db.get_all_verified)

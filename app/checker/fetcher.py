@@ -3,7 +3,7 @@ import logging
 import aiohttp
 
 from app import database as db
-from app.checker.parser import dedupe_by_identity, identity_key, link_key, parse_bulk, parse_line
+from app.checker.parser import dedupe_by_identity, identity_key, parse_bulk, parse_line
 from app.config import settings
 
 log = logging.getLogger("fetcher")
@@ -41,13 +41,9 @@ async def fetch_new_candidates() -> list[dict]:
         log.warning("No valid configs parsed from source")
         return []
 
-    rejected = await db.get_recent_rejected(settings.REJECT_COOLDOWN_HOURS * 3600)
-    fresh = [p for p in parsed if link_key(p["raw_link"]) not in rejected]
-
-    candidates = dedupe_by_identity(fresh, await _known_identities())
+    candidates = dedupe_by_identity(parsed, await _known_identities())
     log.info(
-        "Fetched %d config(s) from source: %d recently rejected, %d already verified/duplicate, "
-        "%d new candidate(s)",
-        len(parsed), len(parsed) - len(fresh), len(fresh) - len(candidates), len(candidates),
+        "Fetched %d config(s) from source: %d already verified/duplicate, %d candidate(s)",
+        len(parsed), len(parsed) - len(candidates), len(candidates),
     )
     return candidates

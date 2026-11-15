@@ -42,17 +42,16 @@ Tuning (all optional):
 | --- | --- | --- |
 | `FUNCTIONAL_TEST_ATTEMPTS` / `FUNCTIONAL_TEST_MIN_PASSES` | 3 / 2 | A proxy must pass at least 2 of up to 3 probes |
 | `FUNCTIONAL_TEST_MAX_LATENCY_MS` | 1000 | Best latency above this fails (0 = off) |
-| `FUNCTIONAL_TEST_EXTRA_CHECKS` | true | Also needs a second target (`FUNCTIONAL_TEST_SECOND_URL`, must return 204) and a 500 KB download (`FUNCTIONAL_TEST_DOWNLOAD_URL`, `FUNCTIONAL_TEST_DOWNLOAD_MIN_BYTES`). A check that fails even without a proxy is skipped for that run |
+| `FUNCTIONAL_TEST_EXTRA_CHECKS` | true | Also needs a second target (`FUNCTIONAL_TEST_SECOND_URL`, must return 204) and a 10 MB download (`FUNCTIONAL_TEST_DOWNLOAD_URL`, `FUNCTIONAL_TEST_DOWNLOAD_MIN_BYTES`; it gets its own `FUNCTIONAL_TEST_DOWNLOAD_TIMEOUT_SECONDS`, 15, which is also the speed gate: 10 MB in 15 s is about 5 Mbps, and at most `FUNCTIONAL_TEST_DOWNLOAD_CONCURRENCY`, 3, run at once). A check that fails even without a proxy is skipped for that run |
 | `REVERIFY_INTERVAL_HOURS` | 1 | Full re-check of the verified list (same strict probe) |
-| `RECHECK_FAILING_INTERVAL_MINUTES` | 15 | Re-test of only the proxies that failed a sweep |
-| `REVERIFY_MAX_FAILS` | 3 | Failed re-checks in a row before removal. A proxy is hidden from the subscription and `/top` after its first failure |
-| `REJECT_COOLDOWN_HOURS` | 6 | How long a failed or removed link is not retried |
 | `FUNCTIONAL_TEST_URL` / `FUNCTIONAL_TEST_EXPECTED_STATUS` | gstatic 204 / 204 | Primary probe (change both together) |
 | `EXIT_GEO_ENABLED` / `EXIT_GEO_URL` | true / ipwho.is | Flag/country of the real exit IP |
 
-Dead proxies: hidden at the first failed check, rechecked every 15 minutes, removed after 3
-failures in a row (about 30 minutes after the first failure) and put into the reject cache so
-they cannot flap back in.
+Dead proxies: a proxy that fails the test (new candidate or hourly sweep) is deleted right away.
+Nothing is remembered about failures. The source list is re-fetched every cycle, so anything
+that is still alive there is simply tested again and can come back. TCP-alive candidates are
+shuffled before each batch so the same dead ones cannot crowd out the rest. If every proxy in a
+sweep fails, the bot assumes its own connection is down and keeps the list.
 
 ## What gets tested
 

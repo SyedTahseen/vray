@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -18,13 +19,6 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-async def _cache_rejections(links: list[str], total: int, passed: int, stage: str) -> None:
-    if await functional_tester.should_cache_rejections(total, passed):
-        await db.add_rejected(links)
-    else:
-        log.warning("No candidate passed the %s and direct internet is down - not caching them as dead", stage)
-
-
 async def fetch_and_test() -> None:
     candidates = await fetcher.fetch_new_candidates()
     if not candidates:
@@ -32,15 +26,13 @@ async def fetch_and_test() -> None:
         return
 
     alive = await tester.test_candidates(candidates)
-    alive_links = {c["raw_link"] for c in alive}
-    await _cache_rejections([c["raw_link"] for c in candidates if c["raw_link"] not in alive_links],
-                            len(candidates), len(alive), "TCP test")
 
+    # Failed proxies are not remembered, so the same dead ones show up every cycle.
+    # Shuffle before taking a batch so they cannot starve the rest of the list.
+    random.shuffle(alive)
     to_verify = await geoip.geolocate_candidates(alive[:settings.FUNCTIONAL_TEST_BATCH_SIZE])
-    verified, failed = await functional_tester.test_new_candidates(to_verify)
+    verified = await functional_tester.test_new_candidates(to_verify)
     added = await db.add_verified_configs(verified)
-    await _cache_rejections([c["raw_link"] for c in failed], len(verified) + len(failed), len(verified),
-                            "real test")
 
     log.info(
         "Cycle complete: %d candidate(s) -> %d TCP-alive -> %d real-tested -> "
@@ -55,13 +47,6 @@ async def reverify() -> None:
         "Reverify sweep complete: %d dead proxy(s) removed, %d still verified",
         removed, await db.count_verified(),
     )
-
-
-async def recheck_failing() -> None:
-    removed = await functional_tester.recheck_failing_configs()
-    if removed:
-        log.info("Failing-proxy recheck: %d dead proxy(s) removed, %d still verified",
-                 removed, await db.count_verified())
 
 
 async def run_periodically(name: str, job, interval_seconds: float, initial_delay: float = 0,
@@ -109,14 +94,6 @@ async def main() -> None:
             run_periodically(
                 f"{settings.REVERIFY_INTERVAL_HOURS:g}-hour verified-list reverify sweep",
                 reverify, reverify_seconds, initial_delay=reverify_seconds,
-                allow_empty_publish=True,
-            )
-        ),
-        asyncio.create_task(
-            run_periodically(
-                "failing-proxy recheck", recheck_failing,
-                settings.RECHECK_FAILING_INTERVAL_MINUTES * 60,
-                initial_delay=settings.RECHECK_FAILING_INTERVAL_MINUTES * 60,
                 allow_empty_publish=True,
             )
         ),
